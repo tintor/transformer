@@ -97,10 +97,10 @@ class Attention(nn.Module):
         self.n_rep = args.n_heads // args.n_kv_heads
 
         # Weight initialize for Keys, Querys, Values and Oupt. Notice that the out_feature value of weight for q and kv are based on it's heads
-        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False, device=device)
-        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=device)
-        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=device)
-        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False, device=device)
+        self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False, device=args.device)
+        self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=args.device)
+        self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=args.device)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False, device=args.device)
 
         # Initialize caches to store Key, Values at start. (KV Cache Implementation)
         self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device)
@@ -176,7 +176,7 @@ def repeat_kv(x:torch.Tensor, n_rep: int)-> torch.Tensor:
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim:int, hidden_dim:int, multiple_of:int, ffn_dim_multiplier: Optional[float]):
+    def __init__(self, dim:int, hidden_dim:int, multiple_of:int, ffn_dim_multiplier: Optional[float], device:str):
         super().__init__()
         # Models embedding dimension
         self.dim = dim
@@ -205,7 +205,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(dim=args.dim, eps=args.norm_eps, device=args.device)
         self.attention = Attention(args)
         self.ff_norm = RMSNorm(dim=args.dim, eps=args.norm_eps, device=args.device)
-        self.feedforward = FeedForward(args.dim, 4 * args.dim, args.multiple_of, args.ffn_dim_multiplier)
+        self.feedforward = FeedForward(dim=args.dim, hidden_dim=4*args.dim, multiple_of=args.multiple_of, ffn_dim_multiplier=args.ffn_dim_multiplier, device=args.device)
 
     def forward(self, x, start_pos, inference):
         # start_pos = token position for inference mode, inference = True for inference and False for training mode
