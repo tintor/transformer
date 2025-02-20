@@ -1,4 +1,5 @@
 import torch
+import math
 from torch import nn
 from torch.nn import functional as F
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ class ModelArgs:
     n_layers: int = 8           # number of model decoder blocks
     n_heads: int = 8            # number of heads for queries embedding
     n_kv_heads: int = 4         # number of heads for keys and values embedding
-    vocab_size: int = 12        # Length of vocabulary
+    vocab_size: int = 85        # Length of vocabulary
     multiple_of: int = 256        # Require to calculate dim of feedfoward network
     ffn_dim_multiplier: Optional[float] = None  # Require to calculate dim of feedfoward network
     norm_eps: float = 1e-5                       # Default Epsilon value set for the RMSNorm calculation
@@ -34,7 +35,7 @@ class RMSNorm(nn.Module):
     # Shape [batch_size, seq, dim] -> [batch_size, seq, dim]
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xf = x.float()
-        xf *= torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return xf.type_as(x) * self.weight
 
 # RoPE
@@ -123,7 +124,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xk[bsz,seq_len,n_kv_heads, head_dim]
         xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xv[bsz,seq_len,n_kv_heads, head_dim]
         
-        freq_cis = self.freqs_cis_inference[start_pos : start_pos + seq_len] if inference else self.freqs_cis_training
+        freqs_cis = self.freqs_cis_inference[start_pos : start_pos + seq_len] if inference else self.freqs_cis_training
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
         if inference:
@@ -150,13 +151,11 @@ class Attention(nn.Module):
         if not inference:
             mask = torch.full((seq_len, seq_len), float("-inf"), device=self.args.device)
             mask = torch.triu(mask, diagonal=1).to(self.args.device)
-            scores += mask
+            scores = scores + mask
 
         # Apply softmax to the attention score
         # TODO substract max value first, for numerical stability - Does F.softmax() already do it?
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        # Matrix multiplication of attention score with the values
-        output = torch.matmul(scores, values).to(self.args.device)
+        output = F.softmax(scores.float(), dim=-1).type_as(xq) @ xv
 
         # We get the contextual embedding for each head
         # All heads need to be reshaped back and combined to give a single single contextual attention output
@@ -215,7 +214,7 @@ class TransformerBlock(nn.Module):
 
         # i) pass attention output to ff_norm and then pass to the feedforward network.
         # ii) the output of feedforward network is then added to the attention output (before ff_norm)
-        return x + self.feedforward(self.ff_norm(h))  # Shape: [batch_size, seq_len, dim]
+        return x + self.feedforward(self.ff_norm(x))  # Shape: [batch_size, seq_len, dim]
 
 
 class Transformer(nn.Module):
@@ -252,6 +251,7 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
+    device = 'cuda'
     print("test rms_norm")
     x = torch.randn((ModelArgs.max_batch_size, ModelArgs.max_seq_len, ModelArgs.dim), device=device)
     rms_norm = RMSNorm(dim=ModelArgs.dim)
@@ -304,7 +304,7 @@ if __name__ == "__main__":
     assert x_out.shape == torch.Size([10, 256, 512])
 
     print("test feed_forward")
-    feed_forward = FeedForward(ModelArgs.dim, 4 * ModelArgs.dim, ModelArgs.multiple_of, ModelArgs.ffn_dim_multiplier)
+    feed_forward = FeedForward(ModelArgs.dim, 4 * ModelArgs.dim, ModelArgs.multiple_of, ModelArgs.ffn_dim_multiplier, device=device)
     x_out = rms_norm(x_out)
     x_out = feed_forward(x_out)
     print(f"feed forward output: x_out.shape: {x_out.shape}")

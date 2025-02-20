@@ -29,6 +29,7 @@ for line in data:
     vocab |= set(line)
 vocab = sorted(list(vocab))
 vocab.extend(['<|begin|>', '<|end|>', '<|pad|>'])
+assert ModelArgs.vocab_size == len(vocab), f"{ModelArgs.vocab_size} vs {len(vocab)}"
 
 # Create a mapping between characters with corresponding integer indexes in vocabulary.
 itos = {i:ch for i, ch in enumerate(vocab)}
@@ -81,6 +82,8 @@ def get_dataset_batch(data, split, args:ModelArgs):
 
 ### Test: get_dataset function ###
 xs, ys = get_dataset_batch(dataset, split="train", args=ModelArgs)
+assert xs.max() < ModelArgs.vocab_size, "Token index exceeds vocab size"
+assert xs.size(1) <= ModelArgs.max_seq_len, "Input sequence exceeds max length"
 print([(decode_tokens(xs[i].tolist()), decode_tokens(ys[i].tolist())) for i in range(len(xs))])
 
 # Define a evaluate loss function to calculate and store training and validation loss for logging and plotting
