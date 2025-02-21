@@ -21,8 +21,11 @@ def load_compressed_csv(name: str) -> List[str]:
         csv_bytes_io = archive.read()[name[:-3]]
         with io.TextIOWrapper(csv_bytes_io, encoding='utf-8', newline='') as csvfile:
             reader = csv.DictReader(csvfile)
+            j = 0
             for row in reader:
                 data.append(row['text'])
+                if (j+1) % 10000 == 0:
+                    print(f"{(j+1)//1000}k")
     return data
 
 
@@ -36,9 +39,9 @@ def build_vocabulary(data: List[str]) -> List[str]:
 
 
 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+
 validation_data = load_compressed_csv('validation.csv.7z')
-train_data = validation_data #load_compressed_csv('train.csv.7z')
+train_data = load_compressed_csv('train.csv.7z')
 
 print("Building vocabulary")
 vocab = build_vocabulary(train_data)
@@ -60,7 +63,6 @@ def decode_tokens(l: List[int]) -> str:
     return ''.join(itos[i] for i in l)
 
 token_end = stoi['<|end|>']
-token_pad = stoi['<|pad|>']
 
 prompt = "Hello World"
 assert decode_tokens(encode_tokens(prompt)) == prompt
@@ -72,11 +74,15 @@ print(f"dataset-shape: {dataset.shape}")
 
 def prepare_dataset(data: List[str], ) -> torch.Tensor:
     size = sum(len(s) + 1 for s in data)
-    tokens = torch.zeros(size, dtype=torch.uint8).to(device)
+    tokens = torch.zeros(size, dtype=torch.uint8)
     offset = 0
-    for s in data:
-        tokens[offset : offset+len(s)+1] = torch.Tensor([stoi[c] for c in s] + [token_end])
+    for j, s in enumerate(data):
+        token_list = [stoi[c] for c in s]
+        token_list.append(token_end)
+        tokens[offset : offset+len(s)+1] = torch.Tensor(token_list)
         offset += len(s) + 1
+        if (j+1) % 10000 == 0:
+            print(f"{(j+1)//1000}k / {len(data)//1000}k")
     assert offset == size
     return tokens
 
@@ -86,15 +92,18 @@ validation_data = prepare_dataset(validation_data)
 train_data = prepare_dataset(train_data)
 
 
+def empty_dataset_batch(args: ModelArgs) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = torch.full([batch_size, seq_len], token_end, dtype=torch.long).to(args.device)
+    y = torch.full([batch_size], token_end, dtype=torch.long).to(args.device)
+    return x, y
+
 
 # Define function to generate batches from the given dataset
-def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs):
+def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs, x: torch.Tensor, y: torch.Tensor):
     batch_size = args.max_batch_size
     seq_len = args.max_seq_len
 
-    x = torch.full([batch_size, seq_len], token_pad, dtype=torch.long).to(args.device)
-    y = torch.full([batch_size], token_pad, dtype=torch.long).to(args.device)
-
+    x[:, :] = token_end
     for i in range(batch_size):
         e = random.randint(0, data.size(0)-1)
         s = max(0, e-args.max_seq_len)
@@ -106,10 +115,9 @@ def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs):
         x[i, 0:e-s] = data[s:e]
         y[i] = data[e]
 
-    return x, y
 
-
-x, y = get_random_dataset_batch(train_data, args=ModelArgs)
+x, y = empty_dataset_batch(ModelArgs)
+get_random_dataset_batch(train_data, ModelArgs, x, y)
 for i in range(ModelArgs.max_batch_size):
     assert torch.count_nonzero(x[i] == token_end) == 0
     print(f"'{decode_tokens(x[i].tolist())}' --> '{itos[y[i]]}'")
@@ -117,20 +125,22 @@ for i in range(ModelArgs.max_batch_size):
 
 # Define a evaluate loss function to calculate and store training and validation loss for logging and plotting
 @torch.no_grad()
-def evaluate_loss(model: Transformer, args:ModelArgs) -> dict[str, float]:
+def evaluate_loss(model: Transformer, args: ModelArgs) -> dict[str, float]:
     out = {}
     model.eval()
 
+    x, y = empty_dataset_batch(args)
+
     losses = []
     for _ in range(10):      
-        x, y = get_random_dataset_batch(train_data, args)
+        get_random_dataset_batch(train_data, args, x, y)
         _, loss = model(x=x, targets=y)
         losses.append(loss.item())
     out['train'] = np.mean(losses)
     
     losses = []
     for _ in range(10):      
-        x, y = get_random_dataset_batch(validation_data, args)
+        get_random_dataset_batch(validation_data, args, x, y)
         _, loss = model(x=x, targets=y)
         losses.append(loss.item())
     out['validation'] = np.mean(losses)
@@ -147,10 +157,11 @@ def train(model: Transformer, optimizer, args: ModelArgs) -> None:
     losses = []   
     start_time = time.time()
 
+    x, y = empty_dataset_batch(args)
     for epoch in range(epochs):
         optimizer.zero_grad()
 
-        x, y = get_random_dataset_batch(train_data, args)
+        get_random_dataset_batch(train_data, args, x, y)
         logits, loss = model(x=x.to(device), targets=y.to(device))
         loss.backward()
         optimizer.step()
@@ -163,8 +174,8 @@ def train(model: Transformer, optimizer, args: ModelArgs) -> None:
             print(f"Epoch {epoch} | train loss {x['train']:.3f} | val loss {x['validation']:.3f} | Time {batch_time:.3f} | Dataset {percent:.6f}%")
             start_time = time.time()
 
-        if epoch % 100 == 99:
-            generate(model, "Once upon a time there was a cat named Elle", ModelArgs)
+        if epoch % 50 == 0:
+            generate(model, "Once upon a time there was a cat named Elle", ModelArgs, max_gen_len=100)
     
     torch.save({'args': args.__dict__, 'state_dict': model.state_dict()}, "transformer.pth")
 
@@ -181,20 +192,17 @@ def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: in
 
     # this tokens matrix is to store the input prompts and all the output that is generated by model.
     # later we'll use the tokenizers decode function to decode this token to view results in text format
-    tokens = torch.full((batch_size, total_len), fill_value=token_pad, dtype=torch.long, device=params.device)
+    tokens = torch.full((batch_size, total_len), fill_value=token_end, dtype=torch.long, device=params.device)
 
     # fill in the prompt tokens into the token matrix
     tokens[:, :len(prompt_tokens)] = torch.tensor(prompt_tokens, dtype=torch.long, device=params.device)
 
-    # Create a prompt_mask_token for later use to identify if the token is a prompt token or a padding token
-    input_text_mask = tokens != token_pad
-
-    print(prompt, end='')
+    print(prompt)
     # Now we can start inferencing using one token at a time from the prompt_tokens list starting with the first position.
     prev_pos = 0
     for cur_pos in range(1, total_len):
         with torch.no_grad():
-            logits, _ = model(x=tokens[:, prev_pos:cur_pos], inference_pos=prev_pos)
+            logits, _ = model(x=tokens[:, prev_pos:cur_pos], inference_pos=cur_pos-1)
         if temperature > 0:      
             probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
             next_token = sample_top_p(probs, top_p)        
@@ -202,18 +210,15 @@ def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: in
             next_token = torch.argmax(logits[:, -1], dim=-1)        
 
         next_token = next_token.reshape(-1)
-
-        # only replace the token if it's a padding token
-        next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-        tokens[:, cur_pos] = next_token
-
-        prev_pos = cur_pos
-        if tokens[:, cur_pos] == token_pad and next_token == token_end:
+        if next_token.item() == token_end:
             break
 
-        print(itos[next_token.item()], end='')
+        tokens[:, cur_pos] = next_token
 
-    print()
+        #print(itos[next_token.item()], end='')
+        print(f"Token {t} '{itos[next_tokten.item()]}'")
+
+    #print()
 
 # Perform top-p (nucleus) sampling on a probability distribution.
 # probs (torch.Tensor): Probability distribution tensor derived from the logits.
