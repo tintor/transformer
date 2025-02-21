@@ -24,8 +24,9 @@ def load_compressed_csv(name: str) -> List[str]:
             j = 0
             for row in reader:
                 data.append(row['text'])
-                if (j+1) % 10000 == 0:
+                if (j+1) % 100000 == 0:
                     print(f"{(j+1)//1000}k")
+                j += 1
     return data
 
 
@@ -34,14 +35,15 @@ def build_vocabulary(data: List[str]) -> List[str]:
     for line in data:
         vocab |= set(line)
     vocab = sorted(list(vocab))
-    vocab.extend(['<|pad|>', '<|end|>'])
+    vocab.extend(['<|end|>'])
     return vocab
 
 
 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 validation_data = load_compressed_csv('validation.csv.7z')
-train_data = load_compressed_csv('train.csv.7z')
+#train_data = load_compressed_csv('train.csv.7z')
+train_data = validation_data
 
 print("Building vocabulary")
 vocab = build_vocabulary(train_data)
@@ -74,14 +76,13 @@ print(f"dataset-shape: {dataset.shape}")
 
 def prepare_dataset(data: List[str], ) -> torch.Tensor:
     size = sum(len(s) + 1 for s in data)
-    tokens = torch.fill(size, token_end, dtype=torch.uint8)
-    offset = 0
-    for j, s in enumerate(data):
-        tokens[offset : offset+len(s)+1] = torch.Tensor([stoi[c] for c in s])
-        offset += len(s) + 1
-        if (j+1) % 10000 == 0:
-            print(f"{(j+1)//1000}k / {len(data)//1000}k")
-    assert offset == size
+    tokens = []
+    for i, s in enumerate(data):
+        tokens.extend(stoi[c] for c in s)
+        tokens.append(token_end)
+        if (i+1) % 100000 == 0:
+            print(f"{(i+1)//1000}k / {len(data)//1000}k")
+    tokens = torch.tensor(tokens, dtype=torch.uint8)
     return tokens
 
 
@@ -91,15 +92,15 @@ train_data = prepare_dataset(train_data)
 
 
 def empty_dataset_batch(args: ModelArgs) -> Tuple[torch.Tensor, torch.Tensor]:
-    x = torch.full([args.batch_size, args.max_seq_len], token_end, dtype=torch.long).to(args.device)
-    y = torch.full([args.batch_size], token_end, dtype=torch.long).to(args.device)
+    x = torch.full([args.max_batch_size, args.max_seq_len], token_end, dtype=torch.long).to(args.device)
+    y = torch.full([args.max_batch_size], token_end, dtype=torch.long).to(args.device)
     return x, y
 
 
 # Define function to generate batches from the given dataset
 def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs, x: torch.Tensor, y: torch.Tensor):
     x[:, :] = token_end
-    for i in range(args.batch_size):
+    for i in range(args.max_batch_size):
         e = random.randint(0, data.size(0)-1)
         s = max(0, e-args.max_seq_len)
         indices = torch.nonzero(data[s:e] == token_end)

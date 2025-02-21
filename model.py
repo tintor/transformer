@@ -12,7 +12,7 @@ class ModelArgs:
     n_layers: int = 8           # number of model decoder blocks
     n_heads: int = 8            # number of heads for queries embedding
     n_kv_heads: int = 4         # number of heads for keys and values embedding
-    vocab_size: int = 95        # Length of vocabulary
+    vocab_size: int = 83        # Length of vocabulary
     multiple_of: int = 256        # Require to calculate dim of feedfoward network
     ffn_dim_multiplier: Optional[float] = None  # Require to calculate dim of feedfoward network
     norm_eps: float = 1e-5                       # Default Epsilon value set for the RMSNorm calculation
