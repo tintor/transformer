@@ -12,7 +12,7 @@ class ModelArgs:
     n_layers: int = 8           # number of model decoder blocks
     n_heads: int = 8            # number of heads for queries embedding
     n_kv_heads: int = 4         # number of heads for keys and values embedding
-    vocab_size: int = 85        # Length of vocabulary
+    vocab_size: int = 96        # Length of vocabulary
     multiple_of: int = 256        # Require to calculate dim of feedfoward network
     ffn_dim_multiplier: Optional[float] = None  # Require to calculate dim of feedfoward network
     norm_eps: float = 1e-5                       # Default Epsilon value set for the RMSNorm calculation
@@ -83,7 +83,6 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 # Group Query Attention with KV Cache
 class Attention(nn.Module):
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -110,9 +109,10 @@ class Attention(nn.Module):
         self.freqs_cis_inference = precompute_freqs_cis(dim=self.head_dim, seq_len=self.args.max_seq_len * 2) # TODO Why x2 for inference?
         self.freqs_cis_training = precompute_freqs_cis(dim=self.head_dim, seq_len=self.args.max_seq_len)
 
-    def forward(self, x: torch.Tensor, start_pos: int, inference: bool) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, inference_pos: int | None = None) -> torch.Tensor:
         # Shape of the input embedding: [bsz,seq_len,dim]
         bsz, seq_len, _ = x.shape
+        start_pos = inference_pos if inteference_pos is not None else 0
         end_pos = start_pos + seq_len
 
         xq = self.wq(x)  #x[bsz,seq_len,dim]*wq[dim,n_heads * head_dim] -> q[bsz,seq_len,n_heads * head_dim]
@@ -127,7 +127,7 @@ class Attention(nn.Module):
         freqs_cis = self.freqs_cis_inference[start_pos : start_pos + seq_len] if inference else self.freqs_cis_training
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
-        if inference:
+        if inference_pos is not None:
             # Store Keys and Values token embedding into their respective cache
             self.cache_k[:bsz, start_pos:end_pos] = xk
             self.cache_v[:bsz, start_pos:end_pos] = xv
@@ -175,7 +175,7 @@ def repeat_kv(x:torch.Tensor, n_rep: int)-> torch.Tensor:
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim:int, hidden_dim:int, multiple_of:int, ffn_dim_multiplier: Optional[float], device:str):
+    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, ffn_dim_multiplier: float | None, device: str):
         super().__init__()
         # Models embedding dimension
         self.dim = dim
@@ -206,11 +206,10 @@ class TransformerBlock(nn.Module):
         self.ff_norm = RMSNorm(dim=args.dim, eps=args.norm_eps, device=args.device)
         self.feedforward = FeedForward(dim=args.dim, hidden_dim=4*args.dim, multiple_of=args.multiple_of, ffn_dim_multiplier=args.ffn_dim_multiplier, device=args.device)
 
-    def forward(self, x, start_pos, inference):
-        # start_pos = token position for inference mode, inference = True for inference and False for training mode
+    def forward(self, x: torch.Tensor, inference_pos: int | None = None):
         # i) pass input embedding to attention_norm and then pass to attention block.
         # ii) the output of attention is then added to embedding(before norm)
-        x = x + self.attention(self.attention_norm(x), start_pos, inference)
+        x = x + self.attention(self.attention_norm(x), inference_pos)
 
         # i) pass attention output to ff_norm and then pass to the feedforward network.
         # ii) the output of feedforward network is then added to the attention output (before ff_norm)
@@ -230,21 +229,20 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(params.dim, eps = params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-    def forward(self, x, start_pos=0, targets=None):  
-        # start_pos = token position for inference mode, inference = True for inference and False for training mode
+    def forward(self, x: torch.Tensor, inference_pos: int | None = None, targets: torch.Tensor | None = None):
+        assert (inference_pos is None and targets is not None) or (inference_pos is not None and targets is None)
         # x is the batch of token_ids generated from the texts or prompts using tokenizers.
         # x[bsz, seq_len] -> h[bsz, seq_len, dim]
-        inference = targets is None
 
         x = self.tok_embeddings(x)
         for layer in self.layers:
-            x = layer(x, start_pos, inference)
+            x = layer(x, inference_pos)
         x = self.norm(x)
 
         # h[bsz, seq_len, dim] -> logits[bsz, seq_len, vocab_size]
         logits = self.output(x).float()
 
-        if inference:
+        if inference_pos is not None:
             return logits, None
 
         return logits, F.cross_entropy(logits.view(-1, self.params.vocab_size), targets.view(-1))
