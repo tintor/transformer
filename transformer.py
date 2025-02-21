@@ -74,12 +74,10 @@ print(f"dataset-shape: {dataset.shape}")
 
 def prepare_dataset(data: List[str], ) -> torch.Tensor:
     size = sum(len(s) + 1 for s in data)
-    tokens = torch.zeros(size, dtype=torch.uint8)
+    tokens = torch.fill(size, token_end, dtype=torch.uint8)
     offset = 0
     for j, s in enumerate(data):
-        token_list = [stoi[c] for c in s]
-        token_list.append(token_end)
-        tokens[offset : offset+len(s)+1] = torch.Tensor(token_list)
+        tokens[offset : offset+len(s)+1] = torch.Tensor([stoi[c] for c in s])
         offset += len(s) + 1
         if (j+1) % 10000 == 0:
             print(f"{(j+1)//1000}k / {len(data)//1000}k")
@@ -93,18 +91,15 @@ train_data = prepare_dataset(train_data)
 
 
 def empty_dataset_batch(args: ModelArgs) -> Tuple[torch.Tensor, torch.Tensor]:
-    x = torch.full([batch_size, seq_len], token_end, dtype=torch.long).to(args.device)
-    y = torch.full([batch_size], token_end, dtype=torch.long).to(args.device)
+    x = torch.full([args.batch_size, args.max_seq_len], token_end, dtype=torch.long).to(args.device)
+    y = torch.full([args.batch_size], token_end, dtype=torch.long).to(args.device)
     return x, y
 
 
 # Define function to generate batches from the given dataset
 def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs, x: torch.Tensor, y: torch.Tensor):
-    batch_size = args.max_batch_size
-    seq_len = args.max_seq_len
-
     x[:, :] = token_end
-    for i in range(batch_size):
+    for i in range(args.batch_size):
         e = random.randint(0, data.size(0)-1)
         s = max(0, e-args.max_seq_len)
         indices = torch.nonzero(data[s:e] == token_end)
