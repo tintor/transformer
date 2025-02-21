@@ -12,16 +12,16 @@ class ModelArgs:
     n_layers: int = 8           # number of model decoder blocks
     n_heads: int = 8            # number of heads for queries embedding
     n_kv_heads: int = 4         # number of heads for keys and values embedding
-    vocab_size: int = 96        # Length of vocabulary
+    vocab_size: int = 84        # Length of vocabulary
     multiple_of: int = 256        # Require to calculate dim of feedfoward network
     ffn_dim_multiplier: Optional[float] = None  # Require to calculate dim of feedfoward network
     norm_eps: float = 1e-5                       # Default Epsilon value set for the RMSNorm calculation
     rope_theta: float = 10000.0   # Default theta value for the RePE calculation
 
-    max_batch_size: int = 10     # Max batch size
+    max_batch_size: int = 64    # Max batch size
     max_seq_len: int = 256         # Max sequence length
 
-    epochs: int = 2500             # Total number of training iteration
+    epochs: int = 1000000       # Total number of training iteration
     log_interval: int = 10        # Number of interval to print the logs and loss values   
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'   # Assign device to cuda or cpu based on availability 
 
@@ -112,7 +112,7 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor, inference_pos: int | None = None) -> torch.Tensor:
         # Shape of the input embedding: [bsz,seq_len,dim]
         bsz, seq_len, _ = x.shape
-        start_pos = inference_pos if inteference_pos is not None else 0
+        start_pos = inference_pos if inference_pos is not None else 0
         end_pos = start_pos + seq_len
 
         xq = self.wq(x)  #x[bsz,seq_len,dim]*wq[dim,n_heads * head_dim] -> q[bsz,seq_len,n_heads * head_dim]
@@ -124,7 +124,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xk[bsz,seq_len,n_kv_heads, head_dim]
         xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xv[bsz,seq_len,n_kv_heads, head_dim]
         
-        freqs_cis = self.freqs_cis_inference[start_pos : start_pos + seq_len] if inference else self.freqs_cis_training
+        freqs_cis = self.freqs_cis_inference[start_pos : start_pos + seq_len] if inference_pos is not None else self.freqs_cis_training
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
 
         if inference_pos is not None:
@@ -148,7 +148,7 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, xk.transpose(2, 3)).to(self.args.device) / math.sqrt(self.head_dim)
 
         # Apply mask during training
-        if not inference:
+        if inference_pos is None:
             mask = torch.full((seq_len, seq_len), float("-inf"), device=self.args.device)
             mask = torch.triu(mask, diagonal=1).to(self.args.device)
             scores = scores + mask
@@ -238,6 +238,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer(x, inference_pos)
         x = self.norm(x)
+        x = x[:, -1, :]
 
         # h[bsz, seq_len, dim] -> logits[bsz, seq_len, vocab_size]
         logits = self.output(x).float()
@@ -245,7 +246,7 @@ class Transformer(nn.Module):
         if inference_pos is not None:
             return logits, None
 
-        return logits, F.cross_entropy(logits.view(-1, self.params.vocab_size), targets.view(-1))
+        return logits, F.cross_entropy(logits, targets)
 
 
 if __name__ == "__main__":

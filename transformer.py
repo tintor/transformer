@@ -8,6 +8,7 @@ import csv
 import sys
 import torch
 import io
+import random
 
 from model import ModelArgs, Transformer
 
@@ -49,7 +50,7 @@ print(f"Vocabulary size: {len(vocab)}")
 assert ModelArgs.vocab_size == len(vocab), f"{ModelArgs.vocab_size} vs {len(vocab)}"
 
 # Create a mapping between characters with corresponding integer indexes in vocabulary.
-itos = {i:ch for i, ch in enumerate(vocab)}
+itos = vocab
 stoi = {ch:i for i, ch in enumerate(vocab)}
 # Tokenizer's encode function: take a string, output a list of integers
 def encode_tokens(s: str) -> List[int]:
@@ -69,23 +70,49 @@ print(f"Example encoded tokens: {encode_tokens(prompt)}")
 dataset = torch.tensor(encode_tokens(train_data[0]), dtype=torch.int).to(ModelArgs.device)
 print(f"dataset-shape: {dataset.shape}")
 
+def prepare_dataset(data: List[str], ) -> torch.Tensor:
+    size = sum(len(s) + 1 for s in data)
+    tokens = torch.zeros(size, dtype=torch.uint8).to(device)
+    offset = 0
+    for s in data:
+        tokens[offset : offset+len(s)+1] = torch.Tensor([stoi[c] for c in s] + [token_end])
+        offset += len(s) + 1
+    assert offset == size
+    return tokens
+
+
+print("Prepare dataset")
+validation_data = prepare_dataset(validation_data)
+train_data = prepare_dataset(train_data)
+
+
+
 # Define function to generate batches from the given dataset
-def get_dataset_batch(data: List[str], args: ModelArgs):
-    seq_len = args.max_seq_len
+def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs):
     batch_size = args.max_batch_size
-    device = args.device
-    batch_data = data
- 
-    ix = torch.randint(0, len(batch_data) - seq_len - 3, (batch_size,)).to(device)
-    x = torch.stack([torch.cat([token_begin, batch_data[i:i+seq_len-1]]) for i in ix]).long().to(device)
-    y = torch.stack([torch.cat([batch_data[i+1:i+seq_len], token_end]) for i in ix]).long().to(device)
+    seq_len = args.max_seq_len
+
+    x = torch.full([batch_size, seq_len], token_pad, dtype=torch.long).to(args.device)
+    y = torch.full([batch_size], token_pad, dtype=torch.long).to(args.device)
+
+    for i in range(batch_size):
+        e = random.randint(0, data.size(0)-1)
+        s = max(0, e-args.max_seq_len)
+        indices = torch.nonzero(data[s:e] == token_end)
+        if indices.size(0) > 0:
+            m = indices[-1]
+            assert data[s + m] == token_end
+            s = s + m + 1
+        x[i, 0:e-s] = data[s:e]
+        y[i] = data[e]
+
     return x, y
 
-### Test: get_dataset function ###
-xs, ys = get_dataset_batch(train_data, args=ModelArgs)
-assert xs.max() < ModelArgs.vocab_size, "Token index exceeds vocab size"
-assert xs.size(1) <= ModelArgs.max_seq_len, "Input sequence exceeds max length"
-print([(decode_tokens(xs[i].tolist()), decode_tokens(ys[i].tolist())) for i in range(len(xs))])
+
+x, y = get_random_dataset_batch(train_data, args=ModelArgs)
+for i in range(ModelArgs.max_batch_size):
+    assert torch.count_nonzero(x[i] == token_end) == 0
+    print(f"'{decode_tokens(x[i].tolist())}' --> '{itos[y[i]]}'")
 
 
 # Define a evaluate loss function to calculate and store training and validation loss for logging and plotting
@@ -96,15 +123,15 @@ def evaluate_loss(model: Transformer, args:ModelArgs) -> dict[str, float]:
 
     losses = []
     for _ in range(10):      
-        xb, yb = get_dataset_batch(train_data, args)
-        _, loss = model(x=xb, targets=yb)
+        x, y = get_random_dataset_batch(train_data, args)
+        _, loss = model(x=x, targets=y)
         losses.append(loss.item())
     out['train'] = np.mean(losses)
     
     losses = []
     for _ in range(10):      
-        xb, yb = get_dataset_batch(validation_data, args)
-        _, loss = model(x=xb, targets=yb)
+        x, y = get_random_dataset_batch(validation_data, args)
+        _, loss = model(x=x, targets=y)
         losses.append(loss.item())
     out['validation'] = np.mean(losses)
 
@@ -123,28 +150,24 @@ def train(model: Transformer, optimizer, args: ModelArgs) -> None:
     for epoch in range(epochs):
         optimizer.zero_grad()
 
-        # TODO there needs to be a loop here
-        xs, ys = get_dataset_batch(train_data, args)
-        logits, loss = model(x=xs.to(device), targets=ys.to(device))
+        x, y = get_random_dataset_batch(train_data, args)
+        logits, loss = model(x=x.to(device), targets=y.to(device))
         loss.backward()
         optimizer.step()
 
         if epoch % log_interval == 0:
             batch_time = time.time() - start_time
             x = evaluate_loss(model, args)
-            losses += [x]            
-            print(f"Epoch {epoch} | val loss {x['val']:.3f} | Time {batch_time:.3f}")
+            losses += [x]
+            percent = (epoch + 1) * args.max_batch_size / train_data.size(0) * 100
+            print(f"Epoch {epoch} | train loss {x['train']:.3f} | val loss {x['validation']:.3f} | Time {batch_time:.3f} | Dataset {percent:.6f}%")
             start_time = time.time()
+
+        if epoch % 100 == 99:
+            generate(model, "Once upon a time there was a cat named Elle", ModelArgs)
     
-    # Print the final validation loss
-    print("validation loss: ", losses[-1]['val'])
-    torch.save({'config': config.__dict__, 'state_dict': model.state_dict()}, "transformer.pth")
+    torch.save({'args': args.__dict__, 'state_dict': model.state_dict()}, "transformer.pth")
 
-
-device = torch.device('cuda')
-model = Transformer(ModelArgs).to(ModelArgs.device)
-optimizer = torch.optim.Adam(model.parameters())
-train(model, optimizer, ModelArgs)
 
 def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: int=500, temperature: float = 0.6, top_p: float = 0.9) -> None:
     # prompt_tokens: List of user input texts or prompts
@@ -152,26 +175,26 @@ def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: in
     # temperature: Temperature value for controlling randomness in sampling. Defaults to 0.6.
     # top_p: Top-p probability threshold for sampling prob output from the logits. Defaults to 0.9.
     batch_size = 1
-    prompt_tokens = token_begin.tolist() + encode_tokens(prompt)
+    prompt_tokens = encode_tokens(prompt)
     assert len(prompt_tokens) <= params.max_seq_len
     total_len = min(len(prompt_tokens) + max_gen_len, params.max_seq_len)   
 
     # this tokens matrix is to store the input prompts and all the output that is generated by model.
     # later we'll use the tokenizers decode function to decode this token to view results in text format
-    tokens = torch.full((batch_size, total_len), fill_value=token_pad, dtype=torch.short, device=params.device)
+    tokens = torch.full((batch_size, total_len), fill_value=token_pad, dtype=torch.long, device=params.device)
 
     # fill in the prompt tokens into the token matrix
-    tokens[:, :len(prompt_tokens)] = torch.tensor(prompt_tokens, dtype=torch.short, device=params.device)
+    tokens[:, :len(prompt_tokens)] = torch.tensor(prompt_tokens, dtype=torch.long, device=params.device)
 
     # Create a prompt_mask_token for later use to identify if the token is a prompt token or a padding token
     input_text_mask = tokens != token_pad
 
-    print(prompt, newline='')
+    print(prompt, end='')
     # Now we can start inferencing using one token at a time from the prompt_tokens list starting with the first position.
     prev_pos = 0
     for cur_pos in range(1, total_len):
         with torch.no_grad():
-            logits, _ = model(x=tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            logits, _ = model(x=tokens[:, prev_pos:cur_pos], inference_pos=prev_pos)
         if temperature > 0:      
             probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
             next_token = sample_top_p(probs, top_p)        
@@ -188,10 +211,9 @@ def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: in
         if tokens[:, cur_pos] == token_pad and next_token == token_end:
             break
 
-        print(itos[next_token.item()], newline='')
+        print(itos[next_token.item()], end='')
 
     print()
-
 
 # Perform top-p (nucleus) sampling on a probability distribution.
 # probs (torch.Tensor): Probability distribution tensor derived from the logits.
@@ -207,5 +229,7 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.multinomial(probs_sort, num_samples=1)
     return torch.gather(prob_idx, -1, next_token)
 
-
-generate(model, "Once upon a time there was a cat named Me Me")
+device = torch.device('cuda')
+model = Transformer(ModelArgs).to(ModelArgs.device)
+optimizer = torch.optim.Adam(model.parameters())
+train(model, optimizer, ModelArgs)
