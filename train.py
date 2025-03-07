@@ -112,13 +112,6 @@ def get_random_dataset_batch(data: torch.Tensor, args: ModelArgs, x: torch.Tenso
         y[i] = data[e]
 
 
-x, y = empty_dataset_batch(ModelArgs)
-get_random_dataset_batch(train_data, ModelArgs, x, y)
-for i in range(ModelArgs.max_batch_size):
-    assert torch.count_nonzero(x[i] == token_end) == 0
-    print(f"'{decode_tokens(x[i].tolist())}' --> '{itos[y[i]]}'")
-
-
 # Define a evaluate loss function to calculate and store training and validation loss for logging and plotting
 @torch.no_grad()
 def evaluate_loss(model: Transformer, args: ModelArgs) -> dict[str, float]:
@@ -212,7 +205,8 @@ def generate(model: Transformer, prompt: str, params: ModelArgs, max_gen_len: in
         tokens[:, cur_pos] = next_token
 
         #print(itos[next_token.item()], end='')
-        print(f"Token {t} '{itos[next_tokten.item()]}'")
+        t = next_token.item()
+        print(f"Token {t} '{itos[t]}'")
 
     #print()
 

@@ -220,7 +220,7 @@ class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
-        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.embedding = nn.Embedding(params.vocab_size, params.dim)
 
         self.layers = nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -234,7 +234,7 @@ class Transformer(nn.Module):
         # x is the batch of token_ids generated from the texts or prompts using tokenizers.
         # x[bsz, seq_len] -> h[bsz, seq_len, dim]
 
-        x = self.tok_embeddings(x)
+        x = self.embedding(x)
         for layer in self.layers:
             x = layer(x, inference_pos)
         x = self.norm(x)
