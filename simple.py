@@ -27,7 +27,7 @@ def build_vocabulary(data: List[str]) -> Tuple[List[str], Dict[str, int]]:
     for line in data:
         vocab |= set(line)
     vocab = sorted(list(vocab))
-    vocab.extend(['<|end|>'])
+    vocab.extend(['<|end|>', '<|pad|>'])
     return vocab, {ch:i for i, ch in enumerate(vocab)}
 
 
@@ -60,7 +60,11 @@ class SelfAttention(nn.Module):
         queries = self.query(x)
         keys = self.key(x)
         values = self.value(x)
-        scores = torch.bmm(queries, keys.transpose(1, 2)) / torch.sqrt(torch.tensor(x.size(-1), dtype=torch.float32))
+        scores = torch.bmm(queries, keys.transpose(1, 2)) / torch.sqrt(torch.tensor(x.size(-1), dtype=torch.float32, device=x.device))
+        # Create a causal mask (lower triangular)
+        seq_len = x.size(1)
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+        scores = scores.masked_fill(mask == 0, float('-inf'))
         attention_weights = torch.softmax(scores, dim=-1)
         attended_values = torch.bmm(attention_weights, values)
         return attended_values
@@ -134,6 +138,7 @@ with open("addition.txt", "w") as f:
 #        data.append(s)
 
 vocab, ivocab = build_vocabulary(data)
+token_pad = ivocab['<|pad|>']
 token_end = ivocab['<|end|>']
 
 hidden_dim = embedding_dim * 4
@@ -174,7 +179,7 @@ scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 def collate_fn(batch):
     xs, ys = zip(*batch)
     # MOD: Ensure each x is 1D and pad them; resulting shape will be (batch_size, max_seq_len)
-    xs = pad_sequence(xs, batch_first=True, padding_value = token_end)
+    xs = pad_sequence(xs, batch_first=True, padding_value = token_pad)
     ys = torch.stack(ys)
     return xs.cuda(), ys.cuda()
 
@@ -192,6 +197,9 @@ def generate(prompt: str) -> str:
         out_token = torch.argmax(output[:, -1, :]).item()
         if out_token == token_end:
             break
+        if out_token == token_pad:
+            prompt += '<|pad|>'
+            break
         prompt += vocab[out_token]
         prompt_tokens.append(out_token)
         if len(prompt) > 100:
@@ -199,7 +207,7 @@ def generate(prompt: str) -> str:
             break
     return prompt
 
-scaler = torch.amp.GradScaler('cuda')
+scaler = torch.amp.GradScaler()
 print(f"Vocab size: {len(vocab)}, Train Sentences: {len(data)}, Train Tokens: {len(train_tokens)}")
 
 @torch.inference_mode()
@@ -213,7 +221,7 @@ def compute_accuracy() -> float:
             with torch.autocast("cuda", dtype=torch.float16):
                 out = model(x)
             # Determine lengths for each sequence (ignoring pad tokens)
-            lengths = (x != token_end).sum(dim=1)
+            lengths = (x != token_pad).sum(dim=1)
             # Get logits of the last non-pad token for each sample
             logits = out[torch.arange(out.size(0)), lengths - 1]
             # Predicted token using argmax
@@ -232,7 +240,7 @@ for epoch in range(num_epochs):
     for x, y in train_loader:
         with torch.autocast('cuda', dtype=torch.float16):
             out = model(x)  # x shape: (batch, seq_len, ...)
-            lengths = (x != token_end).sum(dim=1)  # shape: (batch,)
+            lengths = (x != token_pad).sum(dim=1)  # shape: (batch,)
             out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
             loss = criterion(out, y)
 
