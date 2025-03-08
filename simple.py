@@ -13,8 +13,8 @@ from torch.nn.utils.rnn import pad_sequence
 num_epochs = 10000
 embedding_dim = 16
 num_warmup_steps = 1000
-num_layers = 2
-batch_size = 245 #256
+num_layers = 4
+batch_size = 1024 #256
 compile_mode = "reduce-overhead" # otherwise "default"
 
 learning_rate = 2e-4
@@ -126,19 +126,25 @@ for a in range(0, 10):
         s = f"{sa}+{sb}={sab}"
         data.append(s)
 
-with open("addition.txt", "w") as f:
-    for line in data:
-        f.write(line + '\n')
+while len(data) < 11000:
+    a = sample()
+    b = sample()
+    sa = str(a)[::-1]
+    sb = str(b)[::-1]
+    sab = str(a + b)[::-1]
+    s = f"{sa}+{sb}={sab}"
+    if s not in data:
+        data.append(s)
 
-#while len(data) < 10000:
-#    a = sample()
-#    b = sample()
-#    sa = str(a)[::-1]
-#    sb = str(b)[::-1]
-#    sab = str(a + b)[::-1]
-#    s = f"{sa}+{sb}={sab}"
-#    if s not in data:
-#        data.append(s)
+train_data = data[:10000]
+val_data = data[10000:]
+
+with open("train_data.txt", "w") as f:
+    for line in train_data:
+        f.write(line + '\n')
+with open("val_data.txt", "w") as f:
+    for line in val_data:
+        f.write(line + '\n')
 
 vocab, ivocab = build_vocabulary(data)
 token_pad = ivocab['<|pad|>']
@@ -151,35 +157,28 @@ ts = time.perf_counter()
 model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
 criterion = nn.CrossEntropyLoss()
 scaler = torch.amp.GradScaler()
-if False:
-    with torch.autocast('cuda', dtype=torch.float16):
-        x = torch.randint(0, len(vocab), (batch_size, 10), dtype=torch.long).cuda()
-        y = torch.randint(0, len(vocab), (batch_size,), dtype=torch.long).cuda()
-        out = model(x)
-        lengths = (x != token_pad).sum(dim=1)  # shape: (batch,)
-        out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
-        loss = criterion(out, y)
-    scaler.scale(loss).backward()
 te = time.perf_counter()
-print(f"Compilation took {te-ts:.0f}s")
 
-tokenized_data = [tokenize(sentence, ivocab) for sentence in data]
-f = open("xy.txt", "w")
-train_tokens = []
-for sentence in data:
-    eq = sentence.find('=')
-    tokenized = tokenize(sentence, ivocab)
-    for i in range(eq + 1, len(tokenized) + 1):
-        x = torch.tensor(tokenized[:i], dtype=torch.long).cuda()  # shape: (seq_len,)
-        target = token_end if i == len(tokenized) else tokenized[i]
-        y = torch.tensor(target, dtype=torch.long).cuda()
-        train_tokens.append((x, y))
+def tokenize_dataset(data: List[str]) -> List[Tuple]:
+    #f = open("xy.txt", "w")
+    xy = []
+    for sentence in data:
+        eq = sentence.find('=')
+        tokenized = tokenize(sentence, ivocab)
+        for i in range(eq + 1, len(tokenized) + 1):
+            x = torch.tensor(tokenized[:i], dtype=torch.long).cuda()  # shape: (seq_len,)
+            target = token_end if i == len(tokenized) else tokenized[i]
+            y = torch.tensor(target, dtype=torch.long).cuda()
+            xy.append((x, y))
 
-        t = '$' if i == len(tokenized) else sentence[i]
-        f.write(f"{sentence[:i]} : {t}\n")
-f.close()
+            #t = '$' if i == len(tokenized) else sentence[i]
+            #f.write(f"{sentence[:i]} : {t}\n")
+    #f.close()
+    return xy
+
+train_tokens = tokenize_dataset(train_data)
+val_tokens = tokenize_dataset(val_data)
 num_train_tokens = len(train_tokens)
-
 num_training_steps = num_epochs * int(math.ceil(num_train_tokens / batch_size))
 
 def lr_lambda(current_step: int) -> float:
@@ -206,6 +205,7 @@ def collate_fn(batch):
 
 
 train_loader = DataLoader(train_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+val_loader = DataLoader(val_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
 @torch.inference_mode()
 def generate(prompt: str) -> str:
@@ -241,17 +241,17 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-print(f"Vocab size: {len(vocab)}, Train Sentences: {len(data)}, Train Tokens: {len(train_tokens)}, Model Params: {count_parameters(model)}")
+print(f"Vocab size: {len(vocab)}, Train Sentences: {len(train_data)}, Train Tokens: {len(train_tokens)}, Val Sentences: {len(val_data)}, Val Tokens: {len(val_tokens)}, Model Params: {count_parameters(model)}")
 #print(model)
 
 @torch.inference_mode()
-def compute_accuracy() -> float:
+def compute_accuracy(loader: DataLoader) -> float:
     model.eval()
     correct = 0
     count = 0
 
     with torch.no_grad():
-        for x, y in train_loader:
+        for x, y in loader:
             with torch.autocast("cuda", dtype=torch.float16):
                 out = model(x)
                 # Determine lengths for each sequence (ignoring pad tokens)
@@ -264,6 +264,25 @@ def compute_accuracy() -> float:
                 count += x.size(0)
 
     return correct / count * 100
+
+
+@torch.inference_mode()
+def compute_val_loss() -> float:
+    model.eval()
+    loss_sum = 0
+    loss_count = 0
+
+    for x, y in val_loader:
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = model(x)
+            lengths = (x != token_pad).sum(dim=1)
+            out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
+            loss = criterion(out, y)
+
+            loss_sum += torch.sum(loss)
+            loss_count += loss.numel()
+
+    return loss_sum / loss_count
 
 
 for epoch in range(num_epochs):
@@ -289,24 +308,33 @@ for epoch in range(num_epochs):
         loss_count += 1
     te = time.perf_counter()
     elapsed = te - ts
-    
-    if epoch % 20 == 0:
-        acc = compute_accuracy()
-        _acc = f"{acc:.2f}%"
-    else:
-        acc = 0
-        _acc = ''
 
-    print(f"Epoch {epoch+1}, Train Loss: {loss_sum / loss_count}, Elapsed: {elapsed:.3f}s, Train Accuracy: {_acc}")
+    print(f"Epoch {epoch+1}, Train Loss: {loss_sum / loss_count:.6f}, Elapsed: {elapsed:.3f}s", end='')
+
     if epoch % 20 == 0:
+        val_loss = compute_val_loss()
+        print(f", Val Loss: {val_loss:.6f}", end='')
+        train_acc = compute_accuracy(train_loader)
+        print(f", Train Accuracy: {train_acc:.2f}%", end='')
+        val_acc = compute_accuracy(val_loader)
+        print(f", Val Accuracy: {val_acc:.2f}%", end='')
+        print()
+
         print(f"{generate('0+5=')}")
         print(f"{generate('1+1=')}")
         print(f"{generate('5+5=')}")
         print(f"{generate('9+9=')}")
+        print(f"{generate('01+01=')}")
+        print(f"{generate('99+99=')}")
+        print(f"{generate('555+555=')}")
+        print(f"{generate('123+123=')}")
         print()
-        if acc >= 99.99:
+        if train_acc >= 99.99:
             break
+    else:
+        print()
 
+# TODO smaller type than torch.long for tokens
 # TODO multi head attention (and variants)
 # TODO validation loss
 # TODO flash attention
