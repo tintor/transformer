@@ -2,34 +2,44 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import math
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 import random
 import time
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
+from tqdm import tqdm
+import numpy as np
 
-#torch.backends.cudnn.benchmark = True
 
-num_epochs = 10000
+train_sentences = 1000000
+num_epochs = 10
 embedding_dim = 16
 num_warmup_steps = 1000
 num_layers = 4
-batch_size = 1024 #256
+batch_size = 1024
 compile_mode = "reduce-overhead" # otherwise "default"
 
-learning_rate = 2e-4
-betas = (0.9, 0.95)
+peak_learning_rate = 1e-3
+beta1 = 0.9
+beta2 = 0.95
 weight_decay = 0.1
+flash_attention = True
 
-def tokenize(text: str, ivocab: Dict[str, int]) -> List[int]:
-    return [ivocab[ch] for ch in text]
+wandb_log = True
+wandb_project = 'transformer_simple'
+wandb_run_name = 'run' + str(time.time())
 
+# -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
 
 def build_vocabulary(data: List[str]) -> Tuple[List[str], Dict[str, int]]:
-    vocab = set()
+    vocab_set: Set[str] = set()
     for line in data:
-        vocab |= set(line)
-    vocab = sorted(list(vocab))
+        vocab_set |= set(line)
+
+    vocab: List[str] = sorted(list(vocab_set))
     vocab.extend(['<|end|>', '<|pad|>'])
     return vocab, {ch:i for i, ch in enumerate(vocab)}
 
@@ -63,6 +73,11 @@ class SelfAttention(nn.Module):
         queries = self.query(x)
         keys = self.key(x)
         values = self.value(x)
+
+        if flash_attention:
+            # Use built-in flash attention with causal masking enabled
+            return nn.functional.scaled_dot_product_attention(queries, keys, values, dropout_p=0.0, is_causal=True)
+
         scores = torch.bmm(queries, keys.transpose(1, 2)) / torch.sqrt(torch.tensor(x.size(-1), dtype=torch.float32, device=x.device))
         # Create a causal mask (lower triangular)
         seq_len = x.size(1)
@@ -100,84 +115,201 @@ class LLM(nn.Module):
         self.positional_encoding = PositionalEncoding(embedding_dim)
         self.transformer_blocks = nn.Sequential(*[TransformerBlock(embedding_dim, hidden_dim) for _ in range(num_layers)])
         self.output = nn.Linear(embedding_dim, vocab_size)
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape (batch_size, seq_len)
         x = self.embedding(x)
         x = self.positional_encoding(x)
         x = self.transformer_blocks(x)
         x = self.output(x)
         return x
 
+    def _generate_token(self, tokens: List[int]) -> int:
+        # make tokens size a multiple of 16, to avoid compiling for too many different sizes
+        e = 16 - (len(tokens) % 16)
+        x = torch.tensor(tokens + [token_pad] * e).unsqueeze(0).cuda()
+        with torch.autocast("cuda", dtype=torch.float16):
+            output = self(x)
+            # Use the logit at the last non-pad token position
+            return torch.argmax(output[:, len(tokens)-1, :]).item()
+    
 
-def sample():
-    d = random.randint(0, 3)
+    @torch.inference_mode()
+    def generate(self, text: str, ivocab: Dict[str, int], max_new_tokens: int = 10) -> str:
+        self.eval()
+        tokens = [ivocab[ch] for ch in text]
+
+        for i in range(max_new_tokens):
+            new_token = self._generate_token(tokens)
+            if new_token == token_end:
+                break
+            if new_token == token_pad:
+                text += '<|pad|>'
+                break
+            text += vocab[new_token]
+            tokens.append(new_token)
+    
+        return text
+
+    @torch.inference_mode()
+    def compute_accuracy(self, loader: DataLoader) -> float:
+        model.eval()
+        correct = 0
+        count = 0
+
+        for x, y in loader:
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = self(x)
+                # Determine lengths for each sequence (ignoring pad tokens)
+                lengths = (x != token_pad).sum(dim=1)
+                # Get logits of the last non-pad token for each sample
+                logits = out[torch.arange(out.size(0)), lengths - 1]
+                # Predicted token using argmax
+                preds = torch.argmax(logits, dim=1)
+
+                correct += (preds == y).sum().item()
+                count += x.size(0)
+
+        return correct / count * 100
+
+    @torch.inference_mode()
+    def compute_loss(self, loader: DataLoader) -> float:
+        model.eval()
+        loss_sum = 0
+        loss_count = 0
+
+        for x, y in loader:
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = self(x)
+                lengths = (x != token_pad).sum(dim=1)
+                out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
+                loss = self.cross_entropy_loss(out, y)
+
+                loss_sum += torch.sum(loss)
+                loss_count += loss.numel()
+
+        return loss_sum / loss_count
+
+    def train_batch(self, x: torch.Tensor, y: torch.Tensor) -> float:
+        optimizer.zero_grad()
+        with torch.autocast('cuda', dtype=torch.float16):
+            out = self(x)  # x shape: (batch, seq_len, ...)
+            lengths = (x != token_pad).sum(dim=1)  # shape: (batch,)
+            out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
+            loss = self.cross_entropy_loss(out, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        return loss.item()
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def sample(min_digits: int, max_digits: int) -> int:
+    d = random.randint(min_digits, max_digits)
     if d == 0:
         return 0
     return random.randint(10**(d-1), (10**d) - 1)
 
 
+print("Building dataset")
 data = []
-for a in range(0, 10):
-    for b in range(0, 10):
+for a in range(0, 100):
+    for b in range(0, 100):
         sa = str(a)[::-1]
         sb = str(b)[::-1]
         sab = str(a + b)[::-1]
         s = f"{sa}+{sb}={sab}"
         data.append(s)
 
-while len(data) < 11000:
-    a = sample()
-    b = sample()
+val_sentences = train_sentences // 9
+extra_val_sentences = val_sentences // 9
+
+data_set: Set[str] = set()
+while len(data) < train_sentences + val_sentences:
+    a = sample(0, 4)
+    b = sample(0, 4)
     sa = str(a)[::-1]
     sb = str(b)[::-1]
     sab = str(a + b)[::-1]
     s = f"{sa}+{sb}={sab}"
-    if s not in data:
+    if s not in data_set:
         data.append(s)
+        data_set.union(s)
 
-train_data = data[:10000]
-val_data = data[10000:]
+train_data = data[:train_sentences]
+val_data = data[train_sentences:]
 
-with open("train_data.txt", "w") as f:
-    for line in train_data:
-        f.write(line + '\n')
-with open("val_data.txt", "w") as f:
-    for line in val_data:
-        f.write(line + '\n')
+extra_val_data: List[str] = []
+data_set.clear()
+while len(extra_val_data) < extra_val_sentences:
+    a = sample(0, 5)
+    b = sample(0, 5)
+    sa = str(a)[::-1]
+    sb = str(b)[::-1]
+    if len(sa) <= 4 and len(sb) <= 4:
+        continue
+    sab = str(a + b)[::-1]
+    s = f"{sa}+{sb}={sab}"
+    if s not in data_set:
+        extra_val_data.append(s)
+        data_set.union(s)
+del data_set
+
+def write_data(data: List[str], fname: str) -> None:
+    with open(fname, "w") as f:
+        for line in data:
+            f.write(line + '\n')
+
+write_data(train_data, 'train_data.txt')
+write_data(val_data, 'val_data.txt')
+write_data(extra_val_data, 'extra_val_data.txt')
 
 vocab, ivocab = build_vocabulary(data)
 token_pad = ivocab['<|pad|>']
 token_end = ivocab['<|end|>']
 
-hidden_dim = embedding_dim * 4
-
-print("Compiling model")
-ts = time.perf_counter()
-model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
-criterion = nn.CrossEntropyLoss()
-scaler = torch.amp.GradScaler()
-te = time.perf_counter()
+def collate_fn(batch):
+    xs, ys = zip(*batch)
+    return torch.stack(xs).cuda(), torch.tensor(ys, dtype=torch.long, device='cuda')
 
 def tokenize_dataset(data: List[str]) -> List[Tuple]:
-    #f = open("xy.txt", "w")
     xy = []
-    for sentence in data:
+    max_size = max(len(sentence) for sentence in data)
+    m = np.full((max_size,), token_pad, dtype=np.int64)
+    for sentence in tqdm(data):
         eq = sentence.find('=')
-        tokenized = tokenize(sentence, ivocab)
-        for i in range(eq + 1, len(tokenized) + 1):
-            x = torch.tensor(tokenized[:i], dtype=torch.long).cuda()  # shape: (seq_len,)
-            target = token_end if i == len(tokenized) else tokenized[i]
-            y = torch.tensor(target, dtype=torch.long).cuda()
-            xy.append((x, y))
 
-            #t = '$' if i == len(tokenized) else sentence[i]
-            #f.write(f"{sentence[:i]} : {t}\n")
-    #f.close()
+        tokenized = np.fromiter((ivocab[ch] for ch in sentence), dtype=np.int64, count=len(sentence))
+        for i in range(eq + 1, len(tokenized) + 1):
+            m[:i] = tokenized[:i]
+            m[i:] = token_pad
+            x = torch.tensor(m)  # creates a copy
+            y = token_end if i == len(tokenized) else int(tokenized[i])
+            xy.append((x, y))
     return xy
 
+print("Train tokens")
 train_tokens = tokenize_dataset(train_data)
+train_loader = DataLoader(train_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+print("Val tokens")
 val_tokens = tokenize_dataset(val_data)
+val_loader = DataLoader(val_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+print("Extra val tokens")
+extra_val_tokens = tokenize_dataset(extra_val_data)
+extra_val_loader = DataLoader(extra_val_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
+print("Build model")
+hidden_dim = embedding_dim * 4
+model = LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda()
+#model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
+scaler = torch.amp.GradScaler()
+
 num_train_tokens = len(train_tokens)
 num_training_steps = num_epochs * int(math.ceil(num_train_tokens / batch_size))
 
@@ -189,155 +321,91 @@ def lr_lambda(current_step: int) -> float:
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return max(0.0, 0.5 * (1. + math.cos(math.pi * progress)))
 
-optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=betas, weight_decay=weight_decay)
+optimizer = optim.AdamW(model.parameters(), lr=peak_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-max_context_size = 20
+print(f"Vocab size: {len(vocab)}, Train Sentences: {len(train_data)}, Train Tokens: {len(train_tokens)}, Val Sentences: {len(val_data)}, Val Tokens: {len(val_tokens)}, Model Params: {model.num_params()}")
 
-# New collate function to pad sequences and form batches.
-def collate_fn(batch):
-    xs, ys = zip(*batch)
-    # Pad each sequence to exactly max_context_size
-    xs = [torch.cat([x, torch.full((max_context_size - len(x),), token_pad).cuda()]) 
-          if len(x) < max_context_size else x
-          for x in xs]
-    return torch.stack(xs).cuda(), torch.stack(ys).cuda()
+total_tokens = 0
+
+if wandb_log:
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    
+    wandb.log({
+        "tokens": 0,
+        "epoch": 0,
+        "train/loss": model.compute_loss(train_loader),
+        "train/acc": model.compute_accuracy(train_loader),
+        "val/loss": model.compute_loss(val_loader),
+        "val/acc": model.compute_accuracy(val_loader),
+        "learning_rate": 0,
+    })
 
 
-train_loader = DataLoader(train_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-val_loader = DataLoader(val_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
-@torch.inference_mode()
-def generate(prompt: str) -> str:
+for epoch in range(1, num_epochs+1):
     ts = time.perf_counter()
-    model.eval()
-    while True:
-        if len(prompt) > max_context_size:
-            prompt += '<|too_long|>'
-            break
-
-        prompt_tokens = tokenize(prompt, ivocab)
-        length = len(prompt_tokens)
-        while len(prompt_tokens) < max_context_size:
-            prompt_tokens.append(token_pad)
-
-        x = torch.tensor(prompt_tokens).unsqueeze(0).cuda()
-        with torch.autocast("cuda", dtype=torch.float16):
-            output = model(x)
-            # Use the logit at the last non-pad token position
-            out_token = torch.argmax(output[:, length - 1, :]).item()
-        if out_token == token_end:
-            break
-        if out_token == token_pad:
-            prompt += '<|pad|>'
-            break
-        prompt += vocab[out_token]
-
-    te = time.perf_counter()
-    return f"{prompt} | {te-ts:.3f}s"
-
-
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-print(f"Vocab size: {len(vocab)}, Train Sentences: {len(train_data)}, Train Tokens: {len(train_tokens)}, Val Sentences: {len(val_data)}, Val Tokens: {len(val_tokens)}, Model Params: {count_parameters(model)}")
-#print(model)
-
-@torch.inference_mode()
-def compute_accuracy(loader: DataLoader) -> float:
-    model.eval()
-    correct = 0
-    count = 0
-
-    with torch.no_grad():
-        for x, y in loader:
-            with torch.autocast("cuda", dtype=torch.float16):
-                out = model(x)
-                # Determine lengths for each sequence (ignoring pad tokens)
-                lengths = (x != token_pad).sum(dim=1)
-                # Get logits of the last non-pad token for each sample
-                logits = out[torch.arange(out.size(0)), lengths - 1]
-                # Predicted token using argmax
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == y).sum().item()
-                count += x.size(0)
-
-    return correct / count * 100
-
-
-@torch.inference_mode()
-def compute_val_loss() -> float:
-    model.eval()
-    loss_sum = 0
-    loss_count = 0
-
-    for x, y in val_loader:
-        with torch.autocast("cuda", dtype=torch.float16):
-            out = model(x)
-            lengths = (x != token_pad).sum(dim=1)
-            out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
-            loss = criterion(out, y)
-
-            loss_sum += torch.sum(loss)
-            loss_count += loss.numel()
-
-    return loss_sum / loss_count
-
-
-for epoch in range(num_epochs):
-    ts = time.perf_counter()
+    torch_elapsed = 0.0
     loss_sum = 0
     loss_count = 0
     model.train()
 
     for x, y in train_loader:
-        with torch.autocast('cuda', dtype=torch.float16):
-            out = model(x)  # x shape: (batch, seq_len, ...)
-            lengths = (x != token_pad).sum(dim=1)  # shape: (batch,)
-            out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
-            loss = criterion(out, y)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-        optimizer.zero_grad()
-
-        loss_sum += loss.item()
+        torch_ts = time.perf_counter()
+        loss_sum += model.train_batch(x, y)
         loss_count += 1
-    te = time.perf_counter()
-    elapsed = te - ts
+        torch_elapsed += time.perf_counter() - torch_ts
+        total_tokens += y.numel()
 
-    print(f"Epoch {epoch+1}, Train Loss: {loss_sum / loss_count:.6f}, Elapsed: {elapsed:.3f}s", end='')
+    train_loss = loss_sum / loss_count
+    elapsed = time.perf_counter() - ts
 
-    if epoch % 20 == 0:
-        val_loss = compute_val_loss()
-        print(f", Val Loss: {val_loss:.6f}", end='')
-        train_acc = compute_accuracy(train_loader)
-        print(f", Train Accuracy: {train_acc:.2f}%", end='')
-        val_acc = compute_accuracy(val_loader)
-        print(f", Val Accuracy: {val_acc:.2f}%", end='')
+    learning_rate = optimizer.param_groups[0]['lr']
+    assert learning_rate > 0
+    print(f"Epoch {epoch}, Tokens {total_tokens}", end='')
+    print(f" Learning Rate {learning_rate}", end='')
+    print(f", Train Loss {train_loss:.6f}", end='')
+    print(f", Elapsed {elapsed:.3f}s", end='')
+    print(f", Torch Elapsed {torch_elapsed:.3f}s", end='')
+
+    if epoch % 1 == 0:
+        ts = time.perf_counter()
+        val_loss = model.compute_loss(val_loader)
+        print(f", Val Loss {val_loss:.6f}", end='')
+        train_acc = model.compute_accuracy(train_loader)
+        print(f", Train Accuracy {train_acc:.2f}%", end='')
+        val_acc = model.compute_accuracy(val_loader)
+        print(f", Val Accuracy {val_acc:.2f}%", end='')
+        extra_val_acc = model.compute_accuracy(extra_val_loader)
+        print(f", Extra Val Accuracy {extra_val_acc:.2f}%", end='')
+        te = time.perf_counter()
+        print(f", Additional Elapsed {te-ts:.3f}s", end='')
         print()
 
-        print(f"{generate('0+5=')}")
-        print(f"{generate('1+1=')}")
-        print(f"{generate('5+5=')}")
-        print(f"{generate('9+9=')}")
-        print(f"{generate('01+01=')}")
-        print(f"{generate('99+99=')}")
-        print(f"{generate('555+555=')}")
-        print(f"{generate('123+123=')}")
+        if wandb_log:
+            wandb.log({
+                "tokens": total_tokens,
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "val/loss": val_loss,
+                "val/acc": val_acc,
+                "extra_val/acc": val_acc,
+                "learning_rate": learning_rate,
+            })
+
+        for e in '0+5 1+1 5+5 9+9 01+01 99+99 555+555 123+123 0+45678 1+99999'.split(' '):
+            print(model.generate(e + '=', ivocab))
         print()
         if train_acc >= 99.99:
             break
     else:
         print()
 
+# TODO parallelize [loading of next batch] with [training of current batch]
+# TODO model checkpointing and resuming
 # TODO smaller type than torch.long for tokens
 # TODO multi head attention (and variants)
-# TODO validation loss
-# TODO flash attention
 # TODO ROPE
 # TODO kv cache
 # TODO fine tuning
