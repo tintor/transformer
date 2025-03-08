@@ -8,11 +8,14 @@ import time
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-num_epochs = 1000
+#torch.backends.cudnn.benchmark = True
+
+num_epochs = 10000
 embedding_dim = 16
 num_warmup_steps = 1000
-num_layers = 10
-batch_size = 64
+num_layers = 2
+batch_size = 245 #256
+compile_mode = "reduce-overhead" # otherwise "default"
 
 learning_rate = 2e-4
 betas = (0.9, 0.95)
@@ -142,8 +145,23 @@ token_pad = ivocab['<|pad|>']
 token_end = ivocab['<|end|>']
 
 hidden_dim = embedding_dim * 4
-model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda())
+
+print("Compiling model")
+ts = time.perf_counter()
+model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
 criterion = nn.CrossEntropyLoss()
+scaler = torch.amp.GradScaler()
+if False:
+    with torch.autocast('cuda', dtype=torch.float16):
+        x = torch.randint(0, len(vocab), (batch_size, 10), dtype=torch.long).cuda()
+        y = torch.randint(0, len(vocab), (batch_size,), dtype=torch.long).cuda()
+        out = model(x)
+        lengths = (x != token_pad).sum(dim=1)  # shape: (batch,)
+        out = out[torch.arange(out.size(0)), lengths - 1]  # shape: (batch, vocab_size)
+        loss = criterion(out, y)
+    scaler.scale(loss).backward()
+te = time.perf_counter()
+print(f"Compilation took {te-ts:.0f}s")
 
 tokenized_data = [tokenize(sentence, ivocab) for sentence in data]
 f = open("xy.txt", "w")
@@ -175,40 +193,56 @@ def lr_lambda(current_step: int) -> float:
 optimizer = optim.AdamW(model.parameters(), lr=learning_rate, betas=betas, weight_decay=weight_decay)
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+max_context_size = 20
+
 # New collate function to pad sequences and form batches.
 def collate_fn(batch):
     xs, ys = zip(*batch)
-    # MOD: Ensure each x is 1D and pad them; resulting shape will be (batch_size, max_seq_len)
-    xs = pad_sequence(xs, batch_first=True, padding_value = token_pad)
-    ys = torch.stack(ys)
-    return xs.cuda(), ys.cuda()
+    # Pad each sequence to exactly max_context_size
+    xs = [torch.cat([x, torch.full((max_context_size - len(x),), token_pad).cuda()]) 
+          if len(x) < max_context_size else x
+          for x in xs]
+    return torch.stack(xs).cuda(), torch.stack(ys).cuda()
 
 
 train_loader = DataLoader(train_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
 @torch.inference_mode()
 def generate(prompt: str) -> str:
+    ts = time.perf_counter()
     model.eval()
-    prompt_tokens = tokenize(prompt, ivocab)
     while True:
-        input_tensor = torch.tensor(prompt_tokens).unsqueeze(0).cuda()
+        if len(prompt) > max_context_size:
+            prompt += '<|too_long|>'
+            break
+
+        prompt_tokens = tokenize(prompt, ivocab)
+        length = len(prompt_tokens)
+        while len(prompt_tokens) < max_context_size:
+            prompt_tokens.append(token_pad)
+
+        x = torch.tensor(prompt_tokens).unsqueeze(0).cuda()
         with torch.autocast("cuda", dtype=torch.float16):
-            output = model(input_tensor)
-        out_token = torch.argmax(output[:, -1, :]).item()
+            output = model(x)
+            # Use the logit at the last non-pad token position
+            out_token = torch.argmax(output[:, length - 1, :]).item()
         if out_token == token_end:
             break
         if out_token == token_pad:
             prompt += '<|pad|>'
             break
         prompt += vocab[out_token]
-        prompt_tokens.append(out_token)
-        if len(prompt) > 100:
-            prompt += '<|too_long|>'
-            break
-    return prompt
 
-scaler = torch.amp.GradScaler()
-print(f"Vocab size: {len(vocab)}, Train Sentences: {len(data)}, Train Tokens: {len(train_tokens)}")
+    te = time.perf_counter()
+    return f"{prompt} | {te-ts:.3f}s"
+
+
+def count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+print(f"Vocab size: {len(vocab)}, Train Sentences: {len(data)}, Train Tokens: {len(train_tokens)}, Model Params: {count_parameters(model)}")
+#print(model)
 
 @torch.inference_mode()
 def compute_accuracy() -> float:
@@ -220,14 +254,14 @@ def compute_accuracy() -> float:
         for x, y in train_loader:
             with torch.autocast("cuda", dtype=torch.float16):
                 out = model(x)
-            # Determine lengths for each sequence (ignoring pad tokens)
-            lengths = (x != token_pad).sum(dim=1)
-            # Get logits of the last non-pad token for each sample
-            logits = out[torch.arange(out.size(0)), lengths - 1]
-            # Predicted token using argmax
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == y).sum().item()
-            count += x.size(0)
+                # Determine lengths for each sequence (ignoring pad tokens)
+                lengths = (x != token_pad).sum(dim=1)
+                # Get logits of the last non-pad token for each sample
+                logits = out[torch.arange(out.size(0)), lengths - 1]
+                # Predicted token using argmax
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == y).sum().item()
+                count += x.size(0)
 
     return correct / count * 100
 
@@ -237,6 +271,7 @@ for epoch in range(num_epochs):
     loss_sum = 0
     loss_count = 0
     model.train()
+
     for x, y in train_loader:
         with torch.autocast('cuda', dtype=torch.float16):
             out = model(x)  # x shape: (batch, seq_len, ...)
@@ -254,15 +289,28 @@ for epoch in range(num_epochs):
         loss_count += 1
     te = time.perf_counter()
     elapsed = te - ts
+    
+    if epoch % 20 == 0:
+        acc = compute_accuracy()
+        _acc = f"{acc:.2f}%"
+    else:
+        acc = 0
+        _acc = ''
 
-    print(f"Epoch {epoch+1}, Train Loss: {loss_sum / loss_count}, Train Accuracy: {compute_accuracy():.2f}%, Elapsed: {elapsed:.3f}s")
-    print(f"{generate('0+5=')}")
-    print(f"{generate('1+1=')}")
-    print(f"{generate('5+5=')}")
-    print(f"{generate('9+9=')}")
-    compute_accuracy()
+    print(f"Epoch {epoch+1}, Train Loss: {loss_sum / loss_count}, Elapsed: {elapsed:.3f}s, Train Accuracy: {_acc}")
+    if epoch % 20 == 0:
+        print(f"{generate('0+5=')}")
+        print(f"{generate('1+1=')}")
+        print(f"{generate('5+5=')}")
+        print(f"{generate('9+9=')}")
+        print()
+        if acc >= 99.99:
+            break
 
-# TODO multi head attention
+# TODO multi head attention (and variants)
 # TODO validation loss
+# TODO flash attention
 # TODO ROPE
 # TODO kv cache
+# TODO fine tuning
+# TODO RL
