@@ -16,6 +16,7 @@ num_epochs = 10
 embedding_dim = 16
 num_warmup_steps = 1000
 num_layers = 4
+num_heads = 4
 batch_size = 1024
 compile_mode = "reduce-overhead" # otherwise "default"
 
@@ -62,36 +63,39 @@ class PositionalEncoding(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim: int, num_heads: int):
         super(SelfAttention, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = embedding_dim // num_heads
+        assert self.head_dim * num_heads == embedding_dim, "embedding_dim must be divisible by num_heads"
         self.query = nn.Linear(embedding_dim, embedding_dim)
         self.key = nn.Linear(embedding_dim, embedding_dim)
         self.value = nn.Linear(embedding_dim, embedding_dim)
+        self.out = nn.Linear(embedding_dim, embedding_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (batch_size, seq_len, embedding_dim)
-        queries = self.query(x)
-        keys = self.key(x)
-        values = self.value(x)
-
+        B, T, E = x.size()
+        # Project and reshape for multi-head attention
+        q = self.query(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.key(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         if flash_attention:
-            # Use built-in flash attention with causal masking enabled
-            return nn.functional.scaled_dot_product_attention(queries, keys, values, dropout_p=0.0, is_causal=True)
-
-        scores = torch.bmm(queries, keys.transpose(1, 2)) / torch.sqrt(torch.tensor(x.size(-1), dtype=torch.float32, device=x.device))
-        # Create a causal mask (lower triangular)
-        seq_len = x.size(1)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
-        scores = scores.masked_fill(mask == 0, float('-inf'))
-        attention_weights = torch.softmax(scores, dim=-1)
-        attended_values = torch.bmm(attention_weights, values)
-        return attended_values
+            attn_out = nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            mask = torch.tril(torch.ones(T, T, device=x.device)).unsqueeze(0).unsqueeze(0)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+            attn = torch.softmax(scores, dim=-1)
+            attn_out = torch.matmul(attn, v)
+        # Reshape back and apply final projection
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, E)
+        return self.out(attn_out)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embedding_dim: int, hidden_dim: int):
+    def __init__(self, embedding_dim: int, hidden_dim: int, num_heads: int):
         super(TransformerBlock, self).__init__()
-        self.attention = SelfAttention(embedding_dim)
+        self.attention = SelfAttention(embedding_dim, num_heads)
         self.feed_forward = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
             nn.ReLU(),
@@ -109,11 +113,11 @@ class TransformerBlock(nn.Module):
 
 
 class LLM(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int):
+    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int, num_heads: int):
         super(LLM, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.positional_encoding = PositionalEncoding(embedding_dim)
-        self.transformer_blocks = nn.Sequential(*[TransformerBlock(embedding_dim, hidden_dim) for _ in range(num_layers)])
+        self.transformer_blocks = nn.Sequential(*[TransformerBlock(embedding_dim, hidden_dim, num_heads) for _ in range(num_layers)])
         self.output = nn.Linear(embedding_dim, vocab_size)
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
@@ -306,7 +310,7 @@ extra_val_loader = DataLoader(extra_val_tokens, batch_size=batch_size, shuffle=T
 
 print("Build model")
 hidden_dim = embedding_dim * 4
-model = LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda()
+model = LLM(len(vocab), embedding_dim, hidden_dim, num_layers=num_layers, num_heads=num_heads).cuda()
 #model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
 scaler = torch.amp.GradScaler()
 
