@@ -1,0 +1,26 @@
+! nVidia driver and CUDA
+
+sudo apt purge nvidia-* cuda-drivers* libnvidia-*
+sudo apt autoremove  
+sudo apt autoclean
+sudo rm -rf /usr/local/cuda*
+sudo reboot
+
+sudo service gdm stop
+
+wget https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_570.86.10_linux.run
+sudo sh cuda_12.8.0_570.86.10_linux.run
+--------
+
+Please make sure that
+ -   PATH includes /usr/local/cuda-12.8/bin
+ -   LD_LIBRARY_PATH includes /usr/local/cuda-12.8/lib64, or, add /usr/local/cuda-12.8/lib64 to /etc/ld.so.conf and run ldconfig as root
+
+! numpy / pytorch / jax
+
+source ~/myenv/bin/activate
+pip install numpy
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+pip install -U "jax[cuda12]"
+
+! libtorch
