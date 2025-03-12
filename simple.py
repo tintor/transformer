@@ -10,6 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import wandb
 
 # local packages
 from rope import apply_rotary_emb, precompute_freqs_cis
@@ -22,6 +23,7 @@ num_warmup_steps = 1000
 num_layers = 4
 num_heads = 4
 batch_size = 1024
+virtual_batch = 100
 compile_mode = "reduce-overhead" # otherwise "default"
 
 peak_learning_rate = 1e-3
@@ -30,7 +32,6 @@ beta2 = 0.95
 weight_decay = 0.1
 flash_attention = True
 
-wandb_log = True
 wandb_project = 'transformer_simple'
 wandb_run_name = 'run' + str(time.time())
 
@@ -40,10 +41,14 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 seed = 42
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed) 
+
+def init_rng_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) 
+
+init_rng_seed(seed)
 
 def build_vocabulary(data: List[str]) -> Tuple[List[str], Dict[str, int]]:
     vocab_set: Set[str] = set()
@@ -363,21 +368,29 @@ num_training_steps = num_epochs * int(math.ceil(num_train_tokens / batch_size))
 def lr_lambda(current_step: int) -> float:
     if current_step < num_warmup_steps:
         # Linear warmup
-        return float(current_step) / float(max(1, num_warmup_steps))
+        return float(current_step + 1) / float(max(1, num_warmup_steps))
     # Cosine decay after warmup
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return max(0.0, 0.5 * (1. + math.cos(math.pi * progress)))
-
+    
 optimizer = optim.AdamW(model.parameters(), lr=peak_learning_rate, betas=(beta1, beta2), weight_decay=weight_decay)
 scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 print(f"Vocab size: {len(vocab)}, Train Sentences: {len(train_data)}, Train Tokens: {len(train_tokens)}, Val Sentences: {len(val_data)}, Val Tokens: {len(val_tokens)}, Model Params: {model.num_params()}")
 
-total_tokens = 0
+def reinitialize_weights(module):
+    if hasattr(module, 'reset_parameters'):
+        module.reset_parameters()
 
-if wandb_log:
+
+def train():
+    total_tokens = 0
+    model.apply(reinitialize_weights)
+    optimizer.state.clear()
+    scheduler.last_epoch = -1
+    scheduler._step_count = 0
+
     ts = time.perf_counter()
-    import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
     train_loss, train_accuracy = model.compute_loss_and_accuracy(train_loader)
@@ -404,66 +417,90 @@ if wandb_log:
     print(f", Extra Val Accuracy {extra_val_acc:.2f}%", end='')
     print()
 
-
-for epoch in range(1, num_epochs+1):
-    ts = time.perf_counter()
-    torch_elapsed = 0.0
-    loss_sum = 0
-    accuracy_sum = 0
-    batch_count = 0
-    model.train()
-
-    for x, y in train_loader:
-        torch_ts = time.perf_counter()
-        loss, accuracy = model.train_batch(x, y)
-        loss_sum += loss
-        accuracy_sum += accuracy
-        batch_count += 1
-        torch_elapsed += time.perf_counter() - torch_ts
-        total_tokens += y.numel()
-
-    train_loss = loss_sum / batch_count
-    train_accuracy = accuracy_sum / batch_count
-    elapsed = time.perf_counter() - ts
-
-    learning_rate = optimizer.param_groups[0]['lr']
-    assert learning_rate > 0
-    print(f"Epoch {epoch}, Tokens {total_tokens}", end='')
-    print(f" Learning Rate {learning_rate}", end='')
-    print(f", Train Loss {train_loss:.6f}", end='')
-    print(f", Train Accuracy {train_accuracy:.2f}%", end='')
-    print(f", Elapsed {elapsed:.3f}s", end='')
-    print(f", Torch Elapsed {torch_elapsed:.3f}s", end='')
-
-    if epoch % 1 == 0:
+    for epoch in range(1, num_epochs+1):
         ts = time.perf_counter()
+        torch_elapsed = 0.0
+        torch_elapsed_vbatch = 0.0
+        loss_sum = 0
+        accuracy_sum = 0
+        batch_count = 0
+        model.train()
+
+        min_learning_rate = 1e100
+        max_learning_rate = 0
+
+        for x, y in tqdm(train_loader):
+            learning_rate = optimizer.param_groups[0]['lr']
+            min_learning_rate = min(min_learning_rate, learning_rate)
+            max_learning_rate = max(max_learning_rate, learning_rate)
+
+            torch_ts = time.perf_counter()
+            loss, accuracy = model.train_batch(x, y)
+            loss_sum += loss
+            accuracy_sum += accuracy
+            batch_count += 1
+            torch_time = time.perf_counter() - torch_ts
+            torch_elapsed_vbatch += torch_time
+            torch_elapsed += torch_time
+            total_tokens += y.numel()
+
+            #if batch_count % virtual_batch == 0:
+            #    print(f"Epoch {epoch}, Batches {batch_count}, Tokens {total_tokens}", end='')
+            #    train_loss = loss_sum / batch_count
+            #    train_accuracy = accuracy_sum / batch_count
+            #    print(f", Inc Train Loss {train_loss:.6f}", end='')
+            #    print(f", Inc Train Accuracy {train_accuracy:.2f}%", end='')
+            #    print(f", Torch Elapsed {torch_elapsed_vbatch:.3f}s", end='')
+            #    print()
+            #    torch_elapsed_vbatch = 0
+
+        train_loss = loss_sum / batch_count
+        train_accuracy = accuracy_sum / batch_count
+        elapsed = time.perf_counter() - ts
+
+        ts = time.perf_counter()
+
+        print(f"Epoch {epoch}, Tokens {total_tokens}", end='')
+        print(f" Learning Rate [{min_learning_rate}, {max_learning_rate}]", end='')
+        print(f", Elapsed {elapsed:.3f}s", end='')
+        print(f", Torch Elapsed {torch_elapsed:.3f}s", end='')
+        
+        train_loss, train_accuracy = model.compute_loss_and_accuracy(train_loader)
+        print(f", Train Loss {train_loss:.6f}", end='')
+        print(f", Train Accuracy {train_accuracy:.4f}%", end='')
+        
         val_loss, val_accuracy = model.compute_loss_and_accuracy(val_loader)
         print(f", Val Loss {val_loss:.6f}", end='')
-        print(f", Val Accuracy {val_accuracy:.2f}%", end='')
+        print(f", Val Accuracy {val_accuracy:.4f}%", end='')
+
         extra_val_acc = model.compute_accuracy(extra_val_loader)
-        print(f", Extra Val Accuracy {extra_val_acc:.2f}%", end='')
+        print(f", Extra Val Accuracy {extra_val_acc:.4f}%", end='')
         te = time.perf_counter()
         print(f", Additional Elapsed {te-ts:.3f}s", end='')
         print()
 
-        if wandb_log:
-            wandb.log({
-                "tokens": total_tokens,
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "train/acc": train_accuracy,
-                "val/loss": val_loss,
-                "val/acc": val_accuracy,
-                "extra_val/acc": extra_val_acc,
-                "learning_rate": learning_rate,
-            })
+        wandb.log({
+            "tokens": total_tokens,
+            "epoch": epoch,
+            "train/loss": train_loss,
+            "train/acc": train_accuracy,
+            "val/loss": val_loss,
+            "val/acc": val_accuracy,
+            "extra_val/acc": extra_val_acc,
+            "learning_rate": learning_rate,
+        })
 
         for e in '0+5 1+1 5+5 9+9 01+01 99+99 555+555 123+123 0+45678 1+99999'.split(' '):
             print(model.generate(e + '=', ivocab))
         print()
-    else:
-        print()
 
+for run in range(10):
+    init_rng_seed(run + 1)
+    wandb_run_name = f'rng_{run}_seed_{run+1}'
+    train()
+
+# TODO swish
+# TODO impact of RNG on training
 # TODO parallelize [loading of next batch] with [training of current batch]
 # TODO model checkpointing and resuming
 # TODO smaller type than torch.long for tokens
