@@ -20,11 +20,10 @@ train_sentences = 1000000
 num_epochs = 10
 embedding_dim = 16
 num_warmup_steps = 1000
-num_layers = 4
+num_layers = 3
 num_heads = 4
 batch_size = 1024
-virtual_batch = 100
-compile_mode = "reduce-overhead" # otherwise "default"
+#virtual_batch = 100
 
 peak_learning_rate = 1e-3
 beta1 = 0.9
@@ -261,46 +260,64 @@ for a in range(0, 100):
     for b in range(0, 100):
         sa = str(a)[::-1]
         sb = str(b)[::-1]
-        sab = str(a + b)[::-1]
-        s = f"{sa}+{sb}={sab}"
-        data.append(s)
+        for c, op in [(a + b, '+'), (a - b, '-'), (a * b, '*')]:
+            if op != '+':
+                continue
+            if op == '-' and a < b:
+                continue
+            if op == '*' and a >= 10 and b >= 10:
+                continue
+            sab = str(c)[::-1]
+            data.append(f"{sa}{op}{sb}={sab}")
 
 val_sentences = train_sentences // 9
 extra_val_sentences = val_sentences // 9
 
+max_seq_len = 0
+
+def generate_example(extra: bool) -> str:
+    global max_seq_len
+    while True:
+        if extra:
+            a = sample(0, 5)
+            b = sample(0, 5)
+        else:
+            a = sample(0, 4)
+            b = sample(0, 4)
+        sa = str(a)[::-1]
+        sb = str(b)[::-1]
+        if extra and len(sa) <= 4 and len(sb) <= 4:
+            continue
+        op = random.choice(['+', '-', '*'])
+        sab = str(a + b)[::-1]
+        s = f'{sa}{op}{sb}={sab}'
+        if not extra:
+            s = ' ' * random.randint(0, max_seq_len - len(s)) + s
+        return s
+
+
 data_set: Set[str] = set()
+extra_val_data: List[str] = []
+while len(extra_val_data) < extra_val_sentences:
+    s = generate_example(True)
+    if s not in data_set:
+        extra_val_data.append(s)
+        data_set.union(s)
+
+max_seq_len = max(len(e) for e in extra_val_data)
+
+data_set.clear()
 while len(data) < train_sentences + val_sentences:
-    a = sample(0, 5)
-    b = sample(0, 5)
-    sa = str(a)[::-1]
-    sb = str(b)[::-1]
-    sab = str(a + b)[::-1]
-    s = f"{sa}+{sb}={sab}"
-    # 21 is max length of sentence in extra_val_data
-    s = ' ' * random.randint(0, 21 - len(s)) + s
+    s = generate_example(False)
     if s not in data_set:
         data.append(s)
         data_set.union(s)
+del data_set
 
 train_data = data[:train_sentences]
 val_data = data[train_sentences:]
 
-extra_val_data: List[str] = []
-data_set.clear()
-while len(extra_val_data) < extra_val_sentences:
-    a = sample(0, 6)
-    b = sample(0, 6)
-    sa = str(a)[::-1]
-    sb = str(b)[::-1]
-    if len(sa) <= 4 and len(sb) <= 4:
-        continue
-    sab = str(a + b)[::-1]
-    s = f"{sa}+{sb}={sab}"
-    if s not in data_set:
-        extra_val_data.append(s)
-        data_set.union(s)
-del data_set
-assert max(len(e) for e in extra_val_data) == max(len(e) for e in data)
+assert max(len(e) for e in extra_val_data) == max(len(e) for e in data), f"{max(len(e) for e in extra_val_data)} vs {max(len(e) for e in data)}"
 
 def write_data(data: List[str], fname: str) -> None:
     with open(fname, "w") as f:
@@ -372,7 +389,6 @@ extra_val_loader = DataLoader(extra_val_tokens, batch_size=batch_size, shuffle=T
 print("Build model")
 hidden_dim = embedding_dim * 4
 model = LLM(len(vocab), embedding_dim, hidden_dim, num_layers=num_layers, num_heads=num_heads).cuda()
-#model = torch.compile(LLM(len(vocab), embedding_dim, hidden_dim, num_layers).cuda(), mode=compile_mode)
 scaler = torch.amp.GradScaler()
 
 num_train_tokens = len(train_tokens)
@@ -391,9 +407,22 @@ scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 print(f"Vocab size: {len(vocab)}, Train Sentences: {len(train_data)}, Train Tokens: {len(train_tokens)}, Val Sentences: {len(val_data)}, Val Tokens: {len(val_tokens)}, Model Params: {model.num_params()}")
 
-def reinitialize_weights(module):
+def reinitialize_weights(module: nn.Module) -> None:
     if hasattr(module, 'reset_parameters'):
         module.reset_parameters()
+
+def save_model(path: str) -> None:
+    ts = time.perf_counter()
+    torch.save({'model_state_dict': model.state_dict(), 'config': config}, f'{path}.pth')
+    te = time.perf_counter()
+    print(f'Saved model to {path} in {te-ts:.3}s')
+
+def load_model(path: str) -> None:
+    global model, config
+    checkpoint = torch.load(f'{path}.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    config = checkpoint['config']
+    globals().update(config)
 
 
 for run in range(10):
@@ -493,7 +522,7 @@ for run in range(10):
         print(f", Val Loss {val_loss:.6f}", end='')
         print(f", Val Accuracy {val_accuracy:.4f}%", end='')
 
-        extra_val_loss, extra_val_accuracy = model.compute_loss_and_accuracy(val_loader)
+        extra_val_loss, extra_val_accuracy = model.compute_loss_and_accuracy(extra_val_loader)
         print(f", Extra Val Loss {extra_val_loss:.6f}", end='')
         print(f", Extra Val Accuracy {extra_val_accuracy:.4f}%", end='')
         te = time.perf_counter()
@@ -519,6 +548,8 @@ for run in range(10):
             print(model.generate(e + '=', ivocab), end='')
             print(' | ', end='')
         print()
+        
+        save_model(f'run_{run}_epoch_{epoch}')
     wandb.finish()
 
 # TODO parallelize [loading of next batch] with [training of current batch]
@@ -528,6 +559,7 @@ for run in range(10):
 # TODO kv cache
 # TODO fine tuning
 # TODO RL
+# TODO store failing examples (and show the top N worst offenders)
 
 # Experiments:
 # - RNG seed
