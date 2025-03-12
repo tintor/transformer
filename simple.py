@@ -190,8 +190,9 @@ class LLM(nn.Module):
     def compute_loss_and_accuracy(self, loader: DataLoader) -> Tuple[float, float]:
         model.eval()
         loss_sum = 0.0
+        loss_count = 0
         accuracy_sum = 0.0
-        count = 0
+        accuracy_count = 0
 
         with torch.autocast("cuda", dtype=torch.float16):
             for x, y in loader:
@@ -201,11 +202,12 @@ class LLM(nn.Module):
                 loss = self.cross_entropy_loss(logits, y)
                 preds = torch.argmax(logits, dim=1)
 
-                loss_sum += torch.sum(loss).item()
-                accuracy_sum += torch.sum(preds == y).item()
-                count += loss.numel()
+                loss_sum += loss.item()
+                loss_count += 1
+                accuracy_sum += (preds == y).sum().item()
+                accuracy_count += x.size(0)
 
-        return loss_sum / count, accuracy_sum / count * 100
+        return loss_sum / loss_count, accuracy_sum / accuracy_count * 100
 
     def train_batch(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[float, float]:
         optimizer.zero_grad()
@@ -256,6 +258,8 @@ while len(data) < train_sentences + val_sentences:
     sb = str(b)[::-1]
     sab = str(a + b)[::-1]
     s = f"{sa}+{sb}={sab}"
+    # 21 is max length of sentence in extra_val_data
+    s = ' ' * random.randint(0, 21 - len(s)) + s
     if s not in data_set:
         data.append(s)
         data_set.union(s)
@@ -278,6 +282,7 @@ while len(extra_val_data) < extra_val_sentences:
         extra_val_data.append(s)
         data_set.union(s)
 del data_set
+assert max(len(e) for e in extra_val_data) == max(len(e) for e in data)
 
 def write_data(data: List[str], fname: str) -> None:
     with open(fname, "w") as f:
@@ -335,7 +340,7 @@ def tokenize_dataset_thread(data):
     return results
 
 print("Train tokens")
-train_tokens = tokenize_dataset_thread(train_data)
+train_tokens = tokenize_dataset(train_data)
 train_loader = DataLoader(train_tokens, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
 print("Val tokens")
