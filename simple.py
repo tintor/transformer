@@ -75,7 +75,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, seq_len, embedding_dim)
         return x + self.pe[:, :x.size(1), :]
-
+    
 
 class SelfAttention(nn.Module):
     def __init__(self, embedding_dim: int, num_heads: int):
@@ -105,6 +105,19 @@ class SelfAttention(nn.Module):
         # Reshape back and apply final projection
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, E)
         return self.out(attn_out)
+    
+
+class Swish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.beta = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.beta * x)
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        self.beta.fill_(1.0)
 
 
 class TransformerBlock(nn.Module):
@@ -125,7 +138,7 @@ class TransformerBlock(nn.Module):
         forwarded = self.feed_forward(x)
         x = self.norm2(x + forwarded)
         return x
-
+    
 
 class LLM(nn.Module):
     def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int, num_heads: int):
@@ -383,7 +396,13 @@ def reinitialize_weights(module):
         module.reset_parameters()
 
 
-def train():
+for run in range(10):
+    seed = 1000 + run
+    print(f"Seed {seed}")
+    config['seed'] = seed
+    init_rng_seed(seed)
+    wandb_run_name = f'rng_{run}_seed_{seed}'
+    
     total_tokens = 0
     model.apply(reinitialize_weights)
     optimizer.state.clear()
@@ -391,10 +410,11 @@ def train():
     scheduler._step_count = 0
 
     ts = time.perf_counter()
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(reinit=True, project=wandb_project, name=wandb_run_name, config=config)
 
     train_loss, train_accuracy = model.compute_loss_and_accuracy(train_loader)
     val_loss, val_accuracy = model.compute_loss_and_accuracy(val_loader)
+    extra_val_loss, extra_val_accuracy = model.compute_loss_and_accuracy(extra_val_loader)
 
     wandb.log({
         "tokens": 0,
@@ -405,7 +425,6 @@ def train():
         "val/acc": val_accuracy,
         "learning_rate": 0,
     })
-    extra_val_acc = model.compute_accuracy(extra_val_loader)
     elapsed = time.perf_counter() - ts
 
     print(f"Initial state", end='')
@@ -414,7 +433,8 @@ def train():
     print(f", Elapsed {elapsed:.3f}s", end='')
     print(f", Val Loss {val_loss:.6f}", end='')
     print(f", Val Accuracy {val_accuracy:.2f}%", end='')
-    print(f", Extra Val Accuracy {extra_val_acc:.2f}%", end='')
+    print(f", Extra Val Loss {extra_val_loss:.6f}", end='')
+    print(f", Extra Val Accuracy {extra_val_accuracy:.2f}%", end='')
     print()
 
     for epoch in range(1, num_epochs+1):
@@ -460,8 +480,8 @@ def train():
 
         ts = time.perf_counter()
 
-        print(f"Epoch {epoch}, Tokens {total_tokens}", end='')
-        print(f" Learning Rate [{min_learning_rate}, {max_learning_rate}]", end='')
+        print(f"Run {run}, Epoch {epoch}, Tokens {total_tokens}", end='')
+        print(f" Learning Rate [{min_learning_rate:.1e}, {max_learning_rate:.1e}]", end='')
         print(f", Elapsed {elapsed:.3f}s", end='')
         print(f", Torch Elapsed {torch_elapsed:.3f}s", end='')
         
@@ -473,8 +493,9 @@ def train():
         print(f", Val Loss {val_loss:.6f}", end='')
         print(f", Val Accuracy {val_accuracy:.4f}%", end='')
 
-        extra_val_acc = model.compute_accuracy(extra_val_loader)
-        print(f", Extra Val Accuracy {extra_val_acc:.4f}%", end='')
+        extra_val_loss, extra_val_accuracy = model.compute_loss_and_accuracy(val_loader)
+        print(f", Extra Val Loss {extra_val_loss:.6f}", end='')
+        print(f", Extra Val Accuracy {extra_val_accuracy:.4f}%", end='')
         te = time.perf_counter()
         print(f", Additional Elapsed {te-ts:.3f}s", end='')
         print()
@@ -486,21 +507,20 @@ def train():
             "train/acc": train_accuracy,
             "val/loss": val_loss,
             "val/acc": val_accuracy,
-            "extra_val/acc": extra_val_acc,
-            "learning_rate": learning_rate,
+            "extra_val/loss": extra_val_loss,
+            "extra_val/acc": extra_val_accuracy,
+            "learning_rate/min": min_learning_rate,
+            "learning_rate/max": max_learning_rate,
+            "elapsed": elapsed,
+            "torch_elapsed": torch_elapsed,
         })
 
         for e in '0+5 1+1 5+5 9+9 01+01 99+99 555+555 123+123 0+45678 1+99999'.split(' '):
-            print(model.generate(e + '=', ivocab))
+            print(model.generate(e + '=', ivocab), end='')
+            print(' | ', end='')
         print()
+    wandb.finish()
 
-for run in range(10):
-    init_rng_seed(run + 1)
-    wandb_run_name = f'rng_{run}_seed_{run+1}'
-    train()
-
-# TODO swish
-# TODO impact of RNG on training
 # TODO parallelize [loading of next batch] with [training of current batch]
 # TODO model checkpointing and resuming
 # TODO smaller type than torch.long for tokens
@@ -508,3 +528,9 @@ for run in range(10):
 # TODO kv cache
 # TODO fine tuning
 # TODO RL
+
+# Experiments:
+# - RNG seed
+# - Relu vs Silu vs Swish
+# - Number of layers / Hidden dimensions / Heads
+# - ROPE vs default encoding
